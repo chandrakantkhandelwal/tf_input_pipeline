@@ -20,6 +20,56 @@ import tensorflow.python.platform
 from glob import glob
 import random
 import threading
+from tensorflow.python.framework import ops
+from tensorflow.python.framework import dtypes
+from tensorflow.python.training import queue_runner
+
+# cnn parameters
+batch_size = 8
+img_height = 224
+img_width = 224
+# n_classes = 2 #[1=dog, 0=cat]
+n_img_channels = 3  # RGB image
+n_epochs = 1
+display_step = 100
+# num_test_batches = 0
+# data_path = "./"
+
+# Global constants describing the data set.
+weights_file_path = "./vgg16_weights.npz"
+learning_rate = 0.0001
+IMAGE_SIZE = 224
+IMG_HEIGHT = 224
+IMG_WIDTH = 224
+IMG_DEPTH = 3
+
+NUM_CLASSES = 2 #[1=dog, 0=cat]
+total_train_images = 25000
+num_train_images = 20000
+num_val_images = 5000
+
+INITIALIZE_VGG_MODEL = 1  # to intialize vgg model with weights trained on imagenet
+LOAD_PRETRAINED_MODEL = 0 # to initialize VGG model with  weights trained on dogs and cats images
+VGG_MEAN = [103.939, 116.779, 123.68] #[B, G, R]
+
+FLAGS = tf.app.flags.FLAGS
+
+# Basic model parameters.
+tf.app.flags.DEFINE_integer('batch_size', 8,
+                            """Number of images to process in a batch.""")
+tf.app.flags.DEFINE_string('data_dir', './',
+                           """Path to the data-set directory.""")
+tf.app.flags.DEFINE_boolean('use_fp16', False,
+                            """Train the model using fp16.""")
+
+tf.app.flags.DEFINE_string('train_dir', './train',
+                           """Directory where to write event logs """
+                           """and checkpoint.""")
+tf.app.flags.DEFINE_integer('max_steps', int(num_train_images/batch_size)*n_epochs,
+                            """Number of batches to run.""")
+tf.app.flags.DEFINE_boolean('log_device_placement', False,
+                            """Whether to log device placement.""")
+
 
 
 def conv_layer(input_fmaps, conv_parameters, kh, kw, n_out_fmaps, name, y_stride=1, x_stride=1):
@@ -42,9 +92,9 @@ def conv_layer(input_fmaps, conv_parameters, kh, kw, n_out_fmaps, name, y_stride
     with tf.name_scope(name) as scope:
         kernel_init_val = tf.random_uniform(
             [kh, kw, n_in_fmaps, n_out_fmaps], dtype=tf.float32, minval=-init_range, maxval=init_range)
-        kernel = tf.Variable(kernel_init_val, trainable=True, name='w')
+        kernel = tf.Variable(kernel_init_val, trainable=False, name='w')
         bias_init_val = tf.constant(0.0, shape=[n_out_fmaps], dtype=tf.float32)
-        bias = tf.Variable(bias_init_val, trainable=True, name='b')
+        bias = tf.Variable(bias_init_val, trainable=False, name='b')
         out = tf.nn.relu(tf.nn.bias_add(tf.nn.conv2d(input_fmaps, kernel, strides=[
                          1, y_stride, x_stride, 1], padding='SAME'), bias))
         conv_parameters += [kernel, bias]
@@ -153,37 +203,26 @@ def conv_model(img, conv_parameters, n_classes):
     
     shp = pool5.get_shape()
     flattened_shape = shp[1].value * shp[2].value * shp[3].value
-    reshaped_layer = tf.reshape(pool5, [-1, flattened_shape])
+    reshaped_layer = tf.reshape(pool5, [-1, flattened_shape], name="flat_pool")
 
     fc6 = fc_layer(reshaped_layer, conv_parameters, n_out=4096, name='fc6')
-    relu6 = tf.nn.relu(fc6)
+    with tf.name_scope(name='relu6') as scope:
+        relu6 = tf.nn.relu(fc6)#, name='relu6')
 
     fc7 = fc_layer(relu6, conv_parameters, n_out=4096, name='fc7')
-    relu7 = tf.nn.relu(fc7)
+    with tf.name_scope(name='relu7') as scope:
+        relu7 = tf.nn.relu(fc7)#, name='relu7')
 
-    fc8 = fc_layer(relu7, conv_parameters, n_out=n_classes, name='fc_softmax')
-
-    # # convoution layer with ReLU and GAP
-    # conv6_1 = conv_layer(conv5_3, conv_parameters, kh=3,
-    #                      kw=3, n_out_fmaps=n_gap_channels, name='conv6_1')
-    # gap = avg_pool(conv6_1, name='gap', y_stride=1, x_stride=1, kh=14, kw=14)
-
-    # # flatten the data to pass it to the softmax layer
-    # shp = gap.get_shape()
-    # flattened_shape = shp[1].value * shp[2].value * shp[3].value
-    # reshaped_gap = tf.reshape(gap, [-1, flattened_shape])
-
-    # # final output layer
-    # out = fc_layer(reshaped_gap, n_out=n_classes, name='fc_softmax')
+    fc8 = fc_layer(relu7, conv_parameters, n_out=n_classes, name='fc8')
 
     return fc8
 
 
-def loss_function(fc_softmax, y):
+def loss_function(fc_last_layer, y):
     """loss function
 
     Args:
-    fc_softmax: the final layer of the convolution model
+    fc_last_layer: the final layer of the convolution model
     y: ground truth labels
 
     Returns:
@@ -195,16 +234,15 @@ def loss_function(fc_softmax, y):
     indices = tf.expand_dims(tf.range(0, batch_size, 1), 1)
     concated = tf.concat(1, [indices, y])
     one_hot_labels = tf.sparse_to_dense(
-        concated, tf.pack([batch_size, n_classes]), 1.0, 0.0)
+        concated, tf.pack([batch_size, NUM_CLASSES]), 1.0, 0.0)
 
-    # apply softmax function on the flattened global average pooled layer and
+    # apply softmax function on the and
     # calcualte loss using cross entropy
     cross_entropy = tf.nn.softmax_cross_entropy_with_logits(
-        fc_softmax, one_hot_labels)
+        fc_last_layer, one_hot_labels)
     cost = tf.reduce_mean(cross_entropy)
 
     return cost
-
 
 
 def initialize_conv_layers(weights_file_path, conv_parameters=None, sess=None):
@@ -219,7 +257,7 @@ def initialize_conv_layers(weights_file_path, conv_parameters=None, sess=None):
     keys = sorted(weights.keys())
     # number of layers in the VGG model used (total 16 layers)
     # (convolution layer weights and biases for 13 cnn layers and 2 fc layers)
-    n_layers = 15*2 # (kernel and bias for each layer)
+    n_layers = 15*2 # (kernel and bias for each layer, except the last layer)
 
     if sess and conv_parameters:
         for i, k in enumerate(keys[:n_layers]):
@@ -235,23 +273,30 @@ def train():
     # generate the tensorflow computation graph
     with tf.Graph().as_default():
         # tf graph input
-        x = tf.placeholder(
-            'float', [None, img_height, img_width, n_img_channels], name="InputData")
-        y = tf.placeholder(tf.int32, [None], name="Labels")
+        # x = tf.placeholder(
+        #     'float', [None, img_height, img_width, n_img_channels], name="InputData")
+        # y = tf.placeholder(tf.int32, [None], name="Labels")
+
+        # Get images and labels for the dataset
+        x, y = inputs(data_dir=FLAGS.train_dir, batch_size=FLAGS.batch_size)
+        # val_x, val_y = inputs(data_dir=FLAGS.train_dir, batch_size=FLAGS.batch_size, TRAIN=0)
 
         # contruct CNN model
         conv_parameters = []  # list of cnn layers parameters
-        cnn_out = conv_model(x, conv_parameters, n_classes=n_classes)
+        cnn_out = conv_model(x, conv_parameters, n_classes=NUM_CLASSES)
 
         # define loss and optimizer
         cost = loss_function(cnn_out, y)
-        optimizer = tf.train.AdamOptimizer(
+        optimizer = tf.train.GradientDescentOptimizer(
             learning_rate=learning_rate).minimize(cost)
+        # optimizer = tf.train.AdamOptimizer(
+        #     learning_rate=learning_rate).minimize(cost)
 
         # evaluate model
         correct_pred = tf.equal(tf.cast(tf.argmax(cnn_out, 1), tf.int32), y)
         accuracy = tf.reduce_mean(tf.cast(correct_pred, tf.float32))
 
+        # val_loss = loss_function(cnn_out, val_y)
         # create training summary and save the variables
         tf.scalar_summary('loss_value', cost)
         tf.scalar_summary('accuracy', accuracy)
@@ -270,7 +315,7 @@ def train():
                 sess.run(init)
 
                 # intializes weights and biases of the VGG 16 layers 
-                if initialize_vgg_model:
+                if INITIALIZE_VGG_MODEL:
                     logging.info(
                         "using the pretrained VGG model weights to intialize the layers")
                     initialize_conv_layers(
@@ -279,7 +324,7 @@ def train():
 
                 # load pretrained model (different from the above initialization, it intializes the
                 # model, using pretrained model on the new training data)
-                if load_pretrained_model:
+                if LOAD_PRETRAINED_MODEL:
                     logging.info("loading pretrained model")
                     ckpt = tf.train.get_checkpoint_state('./checkpoints')
                     if ckpt and ckpt.model_checkpoint_path:
@@ -289,118 +334,167 @@ def train():
                         logging.info("no checkpoint found...")
 
                 # write the tensorflow graph
-                writer = tf.train.SummaryWriter('train_logs', sess.graph)
+                summary_writer = tf.train.SummaryWriter('train_logs', sess.graph)
                 tf.train.write_graph(
                     sess.graph_def, "./train_logs", 'train.pbtxt')
                 logging.info("Session Initialized")
+
+                # Start the queue runners.
+                coord = tf.train.Coordinator()
+                tf.train.start_queue_runners(sess=sess, coord=coord)
+                try:
+                    while not coord.should_stop():
+                        for step in xrange(FLAGS.max_steps):
+                          start_time = time.time()
+                          sess.run(optimizer)
+                          acc, loss_value = sess.run([accuracy, cost])
+                          duration = time.time() - start_time
+
+                          assert not np.isnan(loss_value), 'Model diverged with loss = NaN'
+
+                          logging.info("Iter " + str(step) + ", Minibatch Loss= " + "{:.6f}".format(
+                              loss_value) + ", Training Accuracy= " + "{:.5f}".format(acc))
+
+
+                          if step % 100 == 0:
+                            # calculate validation accuracy
+                            # Get images and labels for the dataset
+                            # x, y = inputs(data_dir=FLAGS.train_dir, batch_size=FLAGS.batch_size, TRAIN=0)
+                            # acc, loss_value = sess.run([accuracy, cost])
+                            summary_str = sess.run(summary_op)
+                            summary_writer.add_summary(summary_str, step)
+
+                          # Save the model checkpoint periodically.
+                          if step % 1000 == 0 or (step + 1) == FLAGS.max_steps:
+                            if not os.path.exists("checkpoints"):
+                                os.mkdir("checkpoints")                    
+                            checkpoint_path = os.path.join('checkpoints', 'model.ckpt')
+                            saver.save(sess, checkpoint_path, global_step=step)
                 
-                # for epoch in range(n_epochs):
-                #     # Keep training until reach max iterations
-                #     for _ in xrange(train_data_obj.iter):
-                #         try:
-                #             # mnist.train.next_batch(batch_size)
-                #             batch_x, batch_y = train_data_obj.next_batch()
-                #             batch_y = np.array(batch_y, dtype=np.int32)
-                #             # Fit training using batch data
-                #             sess.run(optimizer, feed_dict={
-                #                      x: batch_x, y: batch_y})
+                except tf.errors.OutOfRangeError:
+                    print('Done training -- epoch limit reached')
 
-                #             # Calculate batch accuracy and loss
-                #             acc = sess.run([accuracy, cost], feed_dict={
-                #                            x: batch_x, y: batch_y})
-                #             logging.info("Iter " + str(train_data_obj.batch_id) + ", Minibatch Loss= " + "{:.6f}".format(
-                #                 acc[1]) + ", Training Accuracy= " + "{:.5f}".format(acc[0]))
+                finally:
+                    # When done, ask the threads to stop.
+                    coord.request_stop()
 
-                #         except Exception as e:
-                #             logging.warn(" Training skipped at batch index %s" % (
-                #                 train_data_obj.batch_id))
-                #             print e
+                # Wait for threads to finish.
+                coord.join(threads)
 
-                #     # save the model after every epoch
-                #     model_name = "model_%s_%s.ckpt" % (
-                #         epoch, train_data_obj.batch_id)
-                #     if not os.path.exists("checkpoints"):
-                #         os.mkdir("checkpoints")
 
-                #     checkpoint_path = saver.save(
-                #         sess, os.path.join("checkpoints", model_name))
-                #     logging.info("saving model %s" % checkpoint_path)
-
-                #     # calculate the accuracy on the test data set
-                #     test_accuracy = 0
-                #     for tst_idx in xrange(num_test_batches):
-                #         batch_x, batch_y = train_data_obj(tst_idx, mode="TEST")
-                #         batch_y = np.array(batch_y, dtype=np.int32)
-                #         # print "batch data generated"
-                #         curr_accuracy = sess.run(accuracy, feed_dict={
-                #                                  x: batch_x, y: batch_y})
-                #         test_accuracy = np.add(test_accuracy, curr_accuracy)
-                #         print "Test Accuracy for batch-%s: %s" % (tst_idx, curr_accuracy)
-
-                #     logging.info("Overall test accuracy-%s" %
-                #                  (np.divide(test_accuracy, num_test_batches)))
-
-                
-class ImageData(object):
-    """load the pickled image data and generate batch data for training
-    and testing the nodel
+def read_images_from_disk(input_queue):
+    """Consumes a single filename and label as a ' '-delimited string.
+    Args:
+      filename_and_label_tensor: A scalar string tensor.
+    Returns:
+      Two tensors: the decoded image, and the string label.
     """
+    label = input_queue[1]
+    file_contents = tf.read_file(input_queue[0])
+    image = tf.image.decode_jpeg(file_contents, channels=3)
+    # depth_major = tf.reshape(image, [IMG_DEPTH, IMG_HEIGHT, IMG_WIDTH])
+    # image = tf.transpose(depth_major, [1, 2, 0])
+    # resized_image = tf.image.resize_image_with_crop_or_pad(image,
+    #                                                        IMG_WIDTH, IMG_HEIGHT)
+    resized_image = tf.image.resize_images(image,(256, 256))
+    return resized_image, label
 
-    def __init__(self, mode='TRAIN'):
-        logging.info('Loading {} data...'.format(mode))
-        if mode == 'TRAIN':
-            self.path = os.path.join(data_path, 'train')
-            self.image_files = glob(os.path.join(self.path, '*', '*.jpg'))
+
+def read_labeled_image_list(data_dir):
+    """Reads a .txt file containing pathes and labeles
+    Args:
+       image_list_file: a .txt file with one /path/to/image per line
+       label: optionally, if set label will be pasted after each line
+    Returns:
+       List with all filenames in file image_list_file
+    """
+    filenames = glob(os.path.join(data_dir, "*.jpg"))
+    # random.shuffle(filenames)
+    labels = []
+    for f in filenames:
+        labels.append([1 if 'dog' in  f else 0][0])
+        f = os.path.join(data_dir, f)
+    return filenames, labels
+
+
+def inputs(data_dir, batch_size, TRAIN=1):
+    """Construct input for evaluation using the Reader ops.
+
+    Args:
+    data_dir: Path to the data directory.
+    batch_size: Number of images per batch.
+
+    Returns:
+    images: Images. 4D tensor of [batch_size, IMAGE_SIZE, IMAGE_SIZE, 3] size.
+    labels: Labels. 1D tensor of [batch_size] size.
+    """
+  
+    image_list, label_list = read_labeled_image_list(data_dir)
+    if TRAIN:
+        images = image_list[:num_train_images]
+        labels = label_list[:num_train_images]
+        images = ops.convert_to_tensor(images, dtype=dtypes.string)
+        labels = ops.convert_to_tensor(labels, dtype=dtypes.int32)
+        # Makes an input queue
+        input_queue = tf.train.slice_input_producer([images, labels], shuffle=True)
+
+        image, label = read_images_from_disk(input_queue)
+        image = tf.cast(image, tf.float32)
+
+        # Image processing for evaluation.
+        # Randomly crop and flip the image horizontally.
+        distorted_image = tf.random_crop(image, (IMG_HEIGHT, IMG_WIDTH, n_img_channels))
+        distorted_image = tf.image.random_flip_left_right(distorted_image)
+        # Because these operations are not commutative, consider randomizing
+        # the order their operation.
+        distorted_image = tf.image.random_brightness(distorted_image,
+                                         max_delta=63)
+        distorted_image = tf.image.random_contrast(distorted_image,
+                                       lower=0.2, upper=1.8)
+        #Subtract off the mean and divide by the variance of the pixels.
+        if INITIALIZE_VGG_MODEL:
+            # Convert RGB to BGR
+            float_image = tf.reshape(distorted_image, [img_width, img_height, n_img_channels], name='reshape_input_image')
+            red, green, blue = tf.split(2, 3, float_image)
+            assert red.get_shape().as_list() == [IMG_HEIGHT, IMG_WIDTH, 1]
+            assert green.get_shape().as_list() == [224, 224, 1]
+            assert blue.get_shape().as_list() == [224, 224, 1]
+            float_image = tf.concat(2, [
+               blue - VGG_MEAN[0],
+               green - VGG_MEAN[1],
+               red - VGG_MEAN[2]])
         else:
-            self.path = os.path.join(data_path, 'test')
-            self.image_files = glob(os.path.join(self.path, '*.jpg'))
-        random.shuffle(self.image_files)
-        logging.info('Finished loading data..')
-        self.size = len(self.image_files)
-        self.batch_id = 0
-        self.iter = int(self.size / batch_size)
+            float_image = tf.image.per_image_standardization(distorted_image)
 
-    def next_batch(self):
-        start = self.batch_id * batch_size
-        end = (self.batch_id + 1) * batch_size
-        self.batch_id += 1
-        if self.batch_id >= self.iter:
-            self.batch_id = 0
-        X = []
-        y = []
-        for i in range(start, end):
-            img = cv2.imread(self.image_files[i])
-            img = cv2.resize(img, (img_height, img_width))
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            img = img.astype('float32') / 255.0
-            X.append(img)
-            label = int(self.image_files[i].split(os.path.sep)[-2][1])
-            y.append(label)
+        min_after_dequeue = 1000
+        capacity = min_after_dequeue + 3 * batch_size
+        X, y = tf.train.shuffle_batch([float_image, label], batch_size=batch_size, num_threads=16, capacity=capacity,
+                                     min_after_dequeue=min_after_dequeue)
+        y = tf.reshape(y, [FLAGS.batch_size], name='y')
 
-        X = np.asarray(X)
-        y = np.asarray(y)
-        return X, y
+    else:
+        images = image_list[num_train_images:]
+        labels = label_list[num_train_images:]
+        images = ops.convert_to_tensor(images, dtype=dtypes.string)
+        labels = ops.convert_to_tensor(labels, dtype=dtypes.int32)
+        # Makes an input queue
+        input_queue = tf.train.slice_input_producer([images, labels], shuffle=False, capacity=1)
+
+        image, label = read_images_from_disk(input_queue)
+        image = tf.cast(image, tf.float32)        
+        image = tf.image.resize_images(image,(IMG_HEIGHT, IMG_WIDTH))
+        float_image = tf.image.per_image_standardization(image)
+        min_after_dequeue = 1000
+        capacity = min_after_dequeue + 3 * batch_size
+
+        X,y = tf.train.batch([float_image, label], batch_size=batch_size, num_threads=16)
+        y = tf.reshape(y, [FLAGS.batch_size], name='y_val')        
+
+
+    return X, y
 
 
 if __name__ == "__main__":
-    data_path = "./"
-    weights_file_path = "./vgg16_weights.npz"
-
-    # cnn parameters
-    batch_size = 16
-    img_height = 224
-    img_width = 224
-    n_classes = 2 #[1=dog, 0=cat]
-    learning_rate = 0.001
-    n_img_channels = 3  # RGB image
-    n_gap_channels = 1024
-    n_epochs = 30
-    display_step = 100
-    num_test_batches = 0
-    initialize_vgg_model = 1
-    load_pretrained_model = 0
-    VGG_MEAN = [103.939, 116.779, 123.68] #[B, G, R]
-
 
     # create the log file
     logger = logging.getLogger('')
