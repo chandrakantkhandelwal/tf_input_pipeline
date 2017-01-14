@@ -10,27 +10,25 @@ import time
 import math
 import cPickle
 import cv2
-import argparse
 import logging
 from datetime import datetime
 import scipy.ndimage
-#import matplotlib.pyplot as plt
 import tensorflow as tf
 import tensorflow.python.platform
 from glob import glob
 import random
-import threading
 from tensorflow.python.framework import ops
 from tensorflow.python.framework import dtypes
 from tensorflow.python.training import queue_runner
+import adamax
 
 # cnn parameters
 batch_size = 8
-img_height = 224
-img_width = 224
+img_height = 150
+img_width = 150
 # n_classes = 2 #[1=dog, 0=cat]
 n_img_channels = 3  # RGB image
-n_epochs = 1
+n_epochs = 5
 display_step = 100
 # num_test_batches = 0
 # data_path = "./"
@@ -38,9 +36,9 @@ display_step = 100
 # Global constants describing the data set.
 weights_file_path = "./vgg16_weights.npz"
 learning_rate = 0.0001
-IMAGE_SIZE = 224
-IMG_HEIGHT = 224
-IMG_WIDTH = 224
+IMAGE_SIZE = 150
+IMG_HEIGHT = 150
+IMG_WIDTH = 150
 IMG_DEPTH = 3
 
 NUM_CLASSES = 2 #[1=dog, 0=cat]
@@ -72,7 +70,7 @@ tf.app.flags.DEFINE_boolean('log_device_placement', False,
 
 
 
-def conv_layer(input_fmaps, conv_parameters, kh, kw, n_out_fmaps, name, y_stride=1, x_stride=1):
+def conv_layer(input_fmaps, conv_parameters, kh, kw, n_out_fmaps, name, get_params, y_stride=1, x_stride=1 ):
     """ convolution layer
     Args:
     input_fmaps: input feature-maps
@@ -86,18 +84,22 @@ def conv_layer(input_fmaps, conv_parameters, kh, kw, n_out_fmaps, name, y_stride
     out: Output f-maps
     """
     n_in_fmaps = input_fmaps.get_shape()[-1].value
-    init_range = math.sqrt(
-        6.0 / (kh * kw * n_in_fmaps + kh * kw * n_out_fmaps))
+    # init_range = math.sqrt(
+    #     6.0 / (kh * kw * n_in_fmaps + kh * kw * n_out_fmaps))
 
     with tf.name_scope(name) as scope:
-        kernel_init_val = tf.random_uniform(
-            [kh, kw, n_in_fmaps, n_out_fmaps], dtype=tf.float32, minval=-init_range, maxval=init_range)
-        kernel = tf.Variable(kernel_init_val, trainable=False, name='w')
+        # kernel_init_val = tf.random_uniform(
+        #     [kh, kw, n_in_fmaps, n_out_fmaps], dtype=tf.float32, minval=-init_range, maxval=init_range)
+        kernel = tf.get_variable("{}weights".format(scope), shape=[kh, kw, n_in_fmaps, n_out_fmaps],
+         dtype=tf.float32, initializer=tf.contrib.layers.xavier_initializer_conv2d(), trainable=False)        
+        # kernel = tf.Variable(kernel_init_val, trainable=False, name='w')
         bias_init_val = tf.constant(0.0, shape=[n_out_fmaps], dtype=tf.float32)
         bias = tf.Variable(bias_init_val, trainable=False, name='b')
         out = tf.nn.relu(tf.nn.bias_add(tf.nn.conv2d(input_fmaps, kernel, strides=[
                          1, y_stride, x_stride, 1], padding='SAME'), bias))
-        conv_parameters += [kernel, bias]
+
+        if get_params:
+            conv_parameters += [kernel, bias]
 
     return out
 
@@ -126,7 +128,7 @@ def max_pool(input_fmaps, name, y_stride=2, x_stride=2, kw=2, kh=2):
 
 
 
-def fc_layer(input_fmaps, conv_parameters, n_out, name):
+def fc_layer(input_fmaps, conv_parameters, n_out, name, get_params):
     """Fully connected layer
 
     Args:
@@ -140,22 +142,25 @@ def fc_layer(input_fmaps, conv_parameters, n_out, name):
     out: activation of the fully connected layer
     """
     n_in = input_fmaps.get_shape()[-1].value
-    init_range = math.sqrt(6.0 / (n_in + n_out))
+    # init_range = math.sqrt(6.0 / (n_in + n_out))
 
     with tf.name_scope(name) as scope:
-        kernel_init_val = tf.random_uniform(
-            [n_in, n_out], dtype=tf.float32, minval=-init_range, maxval=init_range)
-        kernel = tf.Variable(kernel_init_val, trainable=True, name='w')
+        # kernel_init_val = tf.random_uniform(
+        #     [n_in, n_out], dtype=tf.float32, minval=-init_range, maxval=init_range)
+        # kernel = tf.Variable(kernel_init_val, trainable=True, name='w')
+        kernel = tf.get_variable("{}weights".format(scope), shape=[n_in, n_out], dtype=tf.float32, 
+            initializer=tf.contrib.layers.xavier_initializer(), trainable=True)
         bias_init_val = tf.constant(0.0, shape=[n_out], dtype=tf.float32)
         bias = tf.Variable(bias_init_val, trainable=True, name='b')
         out = tf.add(tf.matmul(input_fmaps, kernel), bias)
 
-        conv_parameters +=[kernel, bias]
+        if get_params:
+            conv_parameters +=[kernel, bias]
 
     return out
 
 
-def conv_model(img, conv_parameters, n_classes):
+def conv_model(img, conv_parameters, n_classes, get_params=0):
     """Convolution neural net model (VGG model)
     Args:
     img: input image
@@ -166,54 +171,54 @@ def conv_model(img, conv_parameters, n_classes):
     out: output of the final fully connected layer (apply softmax to it)
     """
     conv1_1 = conv_layer(img, conv_parameters, kh=3, kw=3,
-                         n_out_fmaps=64, name='conv1_1')
+                         n_out_fmaps=64, name='conv1_1', get_params=get_params)
     conv1_2 = conv_layer(conv1_1, conv_parameters, kh=3,
-                         kw=3, n_out_fmaps=64, name='conv1_2')
+                         kw=3, n_out_fmaps=64, name='conv1_2', get_params=get_params)
     pool1 = max_pool(conv1_2, name='pool1')
 
     conv2_1 = conv_layer(pool1, conv_parameters, kh=3,
-                         kw=3, n_out_fmaps=128, name='conv2_1')
+                         kw=3, n_out_fmaps=128, name='conv2_1', get_params=get_params)
     conv2_2 = conv_layer(conv2_1, conv_parameters, kh=3,
-                         kw=3, n_out_fmaps=128, name='conv2_2')
+                         kw=3, n_out_fmaps=128, name='conv2_2', get_params=get_params)
     pool2 = max_pool(conv2_2, name='pool2')
 
     conv3_1 = conv_layer(pool2, conv_parameters, kh=3,
-                         kw=3, n_out_fmaps=256, name='conv3_1')
+                         kw=3, n_out_fmaps=256, name='conv3_1', get_params=get_params)
     conv3_2 = conv_layer(conv3_1, conv_parameters, kh=3,
-                         kw=3, n_out_fmaps=256, name='conv3_2')
+                         kw=3, n_out_fmaps=256, name='conv3_2', get_params=get_params)
     conv3_3 = conv_layer(conv3_2, conv_parameters, kh=3,
-                         kw=3, n_out_fmaps=256, name='conv3_3')
+                         kw=3, n_out_fmaps=256, name='conv3_3', get_params=get_params)
     pool3 = max_pool(conv3_3, name='pool3')
 
     conv4_1 = conv_layer(pool3, conv_parameters, kh=3,
-                         kw=3, n_out_fmaps=512, name='conv4_1')
+                         kw=3, n_out_fmaps=512, name='conv4_1', get_params=get_params)
     conv4_2 = conv_layer(conv4_1, conv_parameters, kh=3,
-                         kw=3, n_out_fmaps=512, name='conv4_2')
+                         kw=3, n_out_fmaps=512, name='conv4_2', get_params=get_params)
     conv4_3 = conv_layer(conv4_2, conv_parameters, kh=3,
-                         kw=3, n_out_fmaps=512, name='conv4_3')
+                         kw=3, n_out_fmaps=512, name='conv4_3', get_params=get_params)
     pool4 = max_pool(conv4_3, name='pool4')
 
     conv5_1 = conv_layer(pool4, conv_parameters, kh=3,
-                         kw=3, n_out_fmaps=512, name='conv5_1')
+                         kw=3, n_out_fmaps=512, name='conv5_1', get_params=get_params)
     conv5_2 = conv_layer(conv5_1, conv_parameters, kh=3,
-                         kw=3, n_out_fmaps=512, name='conv5_2')
+                         kw=3, n_out_fmaps=512, name='conv5_2', get_params=get_params)
     conv5_3 = conv_layer(conv5_2, conv_parameters, kh=3,
-                         kw=3, n_out_fmaps=512, name='conv5_3')
+                         kw=3, n_out_fmaps=512, name='conv5_3', get_params=get_params)
     pool5 = max_pool(conv5_3, name='pool5')
     
     shp = pool5.get_shape()
     flattened_shape = shp[1].value * shp[2].value * shp[3].value
     reshaped_layer = tf.reshape(pool5, [-1, flattened_shape], name="flat_pool")
 
-    fc6 = fc_layer(reshaped_layer, conv_parameters, n_out=4096, name='fc6')
+    fc6 = fc_layer(reshaped_layer, conv_parameters, n_out=4096, name='fc6', get_params=get_params)
     with tf.name_scope(name='relu6') as scope:
         relu6 = tf.nn.relu(fc6)#, name='relu6')
 
-    fc7 = fc_layer(relu6, conv_parameters, n_out=4096, name='fc7')
+    fc7 = fc_layer(relu6, conv_parameters, n_out=4096, name='fc7', get_params=get_params)
     with tf.name_scope(name='relu7') as scope:
         relu7 = tf.nn.relu(fc7)#, name='relu7')
 
-    fc8 = fc_layer(relu7, conv_parameters, n_out=n_classes, name='fc8')
+    fc8 = fc_layer(relu7, conv_parameters, n_out=n_classes, name='fc8', get_params=get_params)
 
     return fc8
 
@@ -257,7 +262,7 @@ def initialize_conv_layers(weights_file_path, conv_parameters=None, sess=None):
     keys = sorted(weights.keys())
     # number of layers in the VGG model used (total 16 layers)
     # (convolution layer weights and biases for 13 cnn layers and 2 fc layers)
-    n_layers = 15*2 # (kernel and bias for each layer, except the last layer)
+    n_layers = 13*2 # (kernel and bias for each layer, except the last layer)
 
     if sess and conv_parameters:
         for i, k in enumerate(keys[:n_layers]):
@@ -270,6 +275,12 @@ def train():
     input data
 
     """
+    all_variables = ['conv1_1/weights:0', 'conv1_1/b:0', 'conv1_2/weights:0', 'conv1_2/b:0', 'conv2_1/weights:0', 
+     'conv2_1/b:0', 'conv2_2/weights:0', 'conv2_2/b:0', 'conv3_1/weights:0', 'conv3_1/b:0', 'conv3_2/weights:0',
+     'conv3_2/b:0', 'conv3_3/weights:0', 'conv3_3/b:0', 'conv4_1/weights:0', 'conv4_1/b:0', 'conv4_2/weights:0',
+     'conv4_2/b:0', 'conv4_3/weights:0', 'conv4_3/b:0', 'conv5_1/weights:0', 'conv5_1/b:0', 'conv5_2/weights:0',
+     'conv5_2/b:0', 'conv5_3/weights:0', 'conv5_3/b:0', 'fc6/weights:0', 'fc6/b:0', 'fc7/weights:0', 'fc7/b:0',
+     'fc8/weights:0', 'fc8/b:0']    
     # generate the tensorflow computation graph
     with tf.Graph().as_default():
         # tf graph input
@@ -279,39 +290,62 @@ def train():
 
         # Get images and labels for the dataset
         x, y = inputs(data_dir=FLAGS.train_dir, batch_size=FLAGS.batch_size)
-        # val_x, val_y = inputs(data_dir=FLAGS.train_dir, batch_size=FLAGS.batch_size, TRAIN=0)
+        val_x, val_y = inputs(data_dir=FLAGS.train_dir, batch_size=FLAGS.batch_size, TRAIN=0)
 
         # contruct CNN model
         conv_parameters = []  # list of cnn layers parameters
-        cnn_out = conv_model(x, conv_parameters, n_classes=NUM_CLASSES)
+        cnn_out = conv_model(x, conv_parameters, n_classes=NUM_CLASSES, get_params=1)
+        val_out = conv_model(x, [], n_classes=NUM_CLASSES, get_params=0)
 
         # define loss and optimizer
         cost = loss_function(cnn_out, y)
-        optimizer = tf.train.GradientDescentOptimizer(
+        val_cost = loss_function(val_out, val_y)
+        optimizer = adamax.AdamaxOptimizer(
             learning_rate=learning_rate).minimize(cost)
         # optimizer = tf.train.AdamOptimizer(
-        #     learning_rate=learning_rate).minimize(cost)
+            # learning_rate=learning_rate).minimize(cost)
 
         # evaluate model
         correct_pred = tf.equal(tf.cast(tf.argmax(cnn_out, 1), tf.int32), y)
         accuracy = tf.reduce_mean(tf.cast(correct_pred, tf.float32))
 
-        # val_loss = loss_function(cnn_out, val_y)
+        val_correct_pred = tf.equal(tf.cast(tf.argmax(val_out, 1), tf.int32), val_y)
+        val_accuracy = tf.reduce_mean(tf.cast(val_correct_pred, tf.float32))
+
         # create training summary and save the variables
-        tf.scalar_summary('loss_value', cost)
-        tf.scalar_summary('accuracy', accuracy)
+        tf.scalar_summary('train_loss_value', cost)
+        tf.scalar_summary('train_accuracy', accuracy)
+        tf.scalar_summary('val_loss_value', val_cost)
+        tf.scalar_summary('val_accuracy', val_accuracy)
+
         summary_op = tf.merge_all_summaries()
-        saver = tf.train.Saver(tf.all_variables())
+        file_name ="./checkpoints/model.ckpt-0.meta"
+        if LOAD_PRETRAINED_MODEL:
+            logging.info("loading pretrained model")
+            ckpt = tf.train.get_checkpoint_state('./checkpoints')
+            ckpt_path = ckpt.model_checkpoint_path
+            print ckpt_path
+            if ckpt and ckpt.model_checkpoint_path:
+                reader = tf.train.NewCheckpointReader(ckpt_path)
+                restore_dict = dict()
+                for v in tf.trainable_variables():
+                    tensor_name = v.name.split(':')[0]
+                    if reader.has_tensor(tensor_name) and tensor_name not in ['fc8/weights', 'fc8/b']:
+                        print('has tensor ', tensor_name)
+                        restore_dict[tensor_name] = v
 
-        # initialize the tensorflow variables
-        init = tf.initialize_all_variables()
+            saver = tf.train.Saver(restore_dict)
+        else:
+            # initialize the tensorflow variables
+            saver = tf.train.Saver(tf.all_variables())
 
+        init = tf.initialize_all_variables()    
         # load the train data object
         #train_data_obj = ImageData()
 
         # launch the graph
         with tf.Session() as sess:
-            with tf.device("/gpu:0"):
+            with tf.device("/cpu:0"):
                 sess.run(init)
 
                 # intializes weights and biases of the VGG 16 layers 
@@ -322,16 +356,8 @@ def train():
                         weights_file_path, conv_parameters=conv_parameters, sess=sess)
                     logging.info('weights and biases are intialized')
 
-                # load pretrained model (different from the above initialization, it intializes the
-                # model, using pretrained model on the new training data)
                 if LOAD_PRETRAINED_MODEL:
-                    logging.info("loading pretrained model")
-                    ckpt = tf.train.get_checkpoint_state('./checkpoints')
-                    if ckpt and ckpt.model_checkpoint_path:
-                        saver.restore(sess, ckpt.model_checkpoint_path)
-                        logging.info('model loaded')
-                    else:
-                        logging.info("no checkpoint found...")
+                    saver.restore(sess, ckpt_path)                        
 
                 # write the tensorflow graph
                 summary_writer = tf.train.SummaryWriter('train_logs', sess.graph)
@@ -356,16 +382,18 @@ def train():
                               loss_value) + ", Training Accuracy= " + "{:.5f}".format(acc))
 
 
-                          if step % 100 == 0:
+                          if (step+1) % 500 == 0:
                             # calculate validation accuracy
                             # Get images and labels for the dataset
-                            # x, y = inputs(data_dir=FLAGS.train_dir, batch_size=FLAGS.batch_size, TRAIN=0)
-                            # acc, loss_value = sess.run([accuracy, cost])
+                            for _ in xrange(int(num_val_images/batch_size)):
+                                val_acc, val_loss_value = sess.run([val_accuracy, val_cost])
+                                logging.info("Iter " + str(step) + ", Minibatch Loss= " + "{:.6f}".format(
+                                    val_loss_value) + ", validation Accuracy= " + "{:.5f}".format(val_acc))                            
                             summary_str = sess.run(summary_op)
                             summary_writer.add_summary(summary_str, step)
 
                           # Save the model checkpoint periodically.
-                          if step % 1000 == 0 or (step + 1) == FLAGS.max_steps:
+                          if step % 500 == 0 or (step + 1) == FLAGS.max_steps:
                             if not os.path.exists("checkpoints"):
                                 os.mkdir("checkpoints")                    
                             checkpoint_path = os.path.join('checkpoints', 'model.ckpt')
@@ -380,6 +408,7 @@ def train():
 
                 # Wait for threads to finish.
                 coord.join(threads)
+                   
 
 
 def read_images_from_disk(input_queue):
@@ -418,8 +447,7 @@ def read_labeled_image_list(data_dir):
 
 
 def inputs(data_dir, batch_size, TRAIN=1):
-    """Construct input for evaluation using the Reader ops.
-
+    """
     Args:
     data_dir: Path to the data directory.
     batch_size: Number of images per batch.
@@ -433,8 +461,7 @@ def inputs(data_dir, batch_size, TRAIN=1):
     if TRAIN:
         images = image_list[:num_train_images]
         labels = label_list[:num_train_images]
-        images = ops.convert_to_tensor(images, dtype=dtypes.string)
-        labels = ops.convert_to_tensor(labels, dtype=dtypes.int32)
+        # labels = ops.convert_to_tensor(labels, dtype=dtypes.int32)
         # Makes an input queue
         input_queue = tf.train.slice_input_producer([images, labels], shuffle=True)
 
@@ -457,8 +484,8 @@ def inputs(data_dir, batch_size, TRAIN=1):
             float_image = tf.reshape(distorted_image, [img_width, img_height, n_img_channels], name='reshape_input_image')
             red, green, blue = tf.split(2, 3, float_image)
             assert red.get_shape().as_list() == [IMG_HEIGHT, IMG_WIDTH, 1]
-            assert green.get_shape().as_list() == [224, 224, 1]
-            assert blue.get_shape().as_list() == [224, 224, 1]
+            assert green.get_shape().as_list() == [IMG_HEIGHT, IMG_WIDTH, 1]
+            assert blue.get_shape().as_list() == [IMG_HEIGHT, IMG_WIDTH, 1]
             float_image = tf.concat(2, [
                blue - VGG_MEAN[0],
                green - VGG_MEAN[1],
@@ -475,15 +502,30 @@ def inputs(data_dir, batch_size, TRAIN=1):
     else:
         images = image_list[num_train_images:]
         labels = label_list[num_train_images:]
-        images = ops.convert_to_tensor(images, dtype=dtypes.string)
-        labels = ops.convert_to_tensor(labels, dtype=dtypes.int32)
+        # images = ops.convert_to_tensor(images, dtype=dtypes.string)
+        # labels = ops.convert_to_tensor(labels, dtype=dtypes.int32)
         # Makes an input queue
         input_queue = tf.train.slice_input_producer([images, labels], shuffle=False, capacity=1)
 
         image, label = read_images_from_disk(input_queue)
         image = tf.cast(image, tf.float32)        
         image = tf.image.resize_images(image,(IMG_HEIGHT, IMG_WIDTH))
-        float_image = tf.image.per_image_standardization(image)
+        # float_image = tf.image.per_image_standardization(image)
+        #Subtract off the mean and divide by the variance of the pixels.
+        if INITIALIZE_VGG_MODEL:
+            # Convert RGB to BGR
+            float_image = tf.reshape(image, [img_width, img_height, n_img_channels], name='reshape_input_image')
+            red, green, blue = tf.split(2, 3, float_image)
+            assert red.get_shape().as_list() == [IMG_HEIGHT, IMG_WIDTH, 1]
+            assert green.get_shape().as_list() == [IMG_HEIGHT, IMG_WIDTH, 1]
+            assert blue.get_shape().as_list() == [IMG_HEIGHT, IMG_WIDTH, 1]
+            float_image = tf.concat(2, [
+               blue - VGG_MEAN[0],
+               green - VGG_MEAN[1],
+               red - VGG_MEAN[2]])
+        else:
+            float_image = tf.image.per_image_standardization(image)
+        
         min_after_dequeue = 1000
         capacity = min_after_dequeue + 3 * batch_size
 
@@ -518,4 +560,6 @@ if __name__ == "__main__":
     logger.addHandler(fh)
     # train the cnn model
     train()
+
+
 
